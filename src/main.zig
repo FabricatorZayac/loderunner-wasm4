@@ -1,7 +1,9 @@
 const w4 = @import("wasm4.zig");
 const tiles = @import("gfx.zig");
 
-const Tile = enum {
+const SCREEN_SIZE = 160;
+
+const TileTag = enum(u3) {
     None,
     Brick,
     BrickHard,
@@ -10,13 +12,37 @@ const Tile = enum {
     LadderWin,
     Rope,
     Gold,
+};
+const Tile = union(TileTag) {
+    None: void,
+    Brick: u16, // 0 is solid, 65535 is freshly dug. Decrement every tick
+    BrickHard: void,
+    BrickFake: void,
+    Ladder: void,
+    LadderWin: void,
+    Rope: void,
+    Gold: void,
 
     const Self = @This();
 
     fn draw(self: Self, x: i32, y: i32) void {
         switch (self) {
             .None, .LadderWin => {},
-            .Brick, .BrickFake => {
+            .Brick => |state| {
+                switch (state) {
+                    0 => {
+                        w4.DRAW_COLORS.* = 0x3;
+                        tiles.brick.draw(x, y, .{});
+                    },
+                    // TODO: Draw better sprites, because these kinda suck huh
+                    1...10, 190...200 => {
+                        w4.DRAW_COLORS.* = 0x10;
+                        tiles.powder[1].draw(x, y, .{});
+                    },
+                    else => {},
+                }
+            },
+            .BrickFake => {
                 w4.DRAW_COLORS.* = 0x3;
                 tiles.brick.draw(x, y, .{});
             },
@@ -39,54 +65,103 @@ const Tile = enum {
         }
     }
 
-    fn isSolid(self: Self) bool {
-        return switch (self) {
-            .Brick, .BrickHard, .Ladder => true,
-            else => false,
-        };
-    }
     fn isBrick(self: Self) bool {
         return switch (self) {
-            .Brick, .BrickHard => true,
+            .Brick => |state| blk: {
+                break :blk if (state == 0) true else false;
+            },
+            .BrickHard => true,
             else => false,
         };
     }
-};
 
-const BrickState = enum {
-    Normal,
-    Breaking,
-    Broken,
+    fn Brick() Self {
+        return Self{ .Brick = 0 };
+    }
 };
 
 const Level = struct {
-    terrain: [18][20]Tile,
-    spawn: i16,
-    enemies: [4]?i16,
+    const GRID_HEIGHT = 18;
+    const GRID_WIDTH = 20;
+    terrain: [GRID_HEIGHT * GRID_WIDTH]Tile,
+    spawn: u16, // positions can't be more than 160 * 160 = 25600
+    enemies: [4]?u16,
 
     const Self = @This();
 
+    fn getTile(self: Self, x: usize, y: usize) Tile {
+        return self.terrain[y * GRID_WIDTH + x];
+    }
+    fn setTile(self: *Self, x: usize, y: usize, newtile: Tile) void {
+        self.terrain[y * GRID_WIDTH + x] = newtile;
+    }
     fn draw(self: Self) void {
-        for (self.terrain, 0..) |row, y| {
-            for (row, 0..) |tile, x| {
-                tile.draw(@intCast(x * 8), @intCast(y * 8));
+        for (self.terrain, 0..) |tile, pos| {
+            tile.draw(
+                @intCast(@mod(pos, GRID_WIDTH) * 8),
+                @intCast(@divFloor(pos, GRID_WIDTH) * 8),
+            );
+        }
+    }
+    fn update(self: *Self) void {
+        for (&self.terrain) |*tile| {
+            if (tile.* == .Brick and tile.Brick > 0) {
+                tile.Brick -= 1;
             }
         }
     }
     fn isCollected(self: Self) bool {
-        for (self.terrain) |row| {
-            for (row) |tile| {
-                if (tile == .Gold) return false;
-            }
+        for (self.terrain) |tile| {
+            if (tile == .Gold) return false;
         }
         return true;
     }
     fn open(self: *Self) void {
-        for (&self.terrain) |*row| {
-            for (row) |*tile| {
-                if (tile.* == .LadderWin) tile.* = .Ladder;
+        for (&self.terrain) |*tile| {
+            if (tile.* == .LadderWin) tile.* = .Ladder;
+        }
+    }
+    fn initPlayer(self: Self) Jeff {
+        return .{ .pos = self.spawn };
+    }
+    // Math time
+    // u3 * 18 * 20 = 1080bit = 135 bytes // terrain repr
+    // u16 = 2 bytes // player spawn
+    // 4 * u16 = 8 bytes // enemy spawns
+    // 135 + 2 + 8 = 145 total bytes
+    fn dump(self: Self) [145]u8 {
+        var terrain_data: [135]u8 = undefined;
+        {
+            // need 135byte / 3byte (24bit) = 45 batches
+            var cursor: usize = 0;
+            while (cursor < 135) : (cursor += 3) {
+                const batch_ptr: *[8]u3 = @ptrCast(&terrain_data[cursor]);
+                for (batch_ptr) |*tile| {
+                    // for each in batch
+                    _ = tile;
+                }
             }
         }
+
+        const spawn_data: [2]u8 = @bitCast(self.spawn);
+
+        // idk man
+        // var enemy_data: [8]u8 = undefined;
+        // {
+        //     var i: usize = 0;
+        //     for (self.enemies) |enemy| {
+        //         enemy_data[i] = if (enemy == null) 0x0000 else @bitCast(enemy);
+        //     }
+        // }
+
+        var out: [145]u8 = undefined;
+        out[135] = spawn_data[0];
+        out[136] = spawn_data[1];
+        // for (enemy_data, 137..145) |byte, i| {
+        //     out[i] = byte;
+        // }
+
+        return out;
     }
 };
 
@@ -96,7 +171,7 @@ const Direction = enum {
 };
 
 const Jeff = struct {
-    facing: Direction = .Right,
+    direction: Direction = .Right,
     pos: i32,
 
     const Self = @This();
@@ -104,12 +179,12 @@ const Jeff = struct {
     fn draw(self: Self) void {
         w4.DRAW_COLORS.* = 0x10;
 
-        if (self.getTile(5) == .Ladder and self.getTile(2) == .Ladder) {
+        if (self.getTile(5) == .Ladder) {
             tiles.jeff[4]
                 .draw(
-                @mod(self.pos, 160),
-                @divFloor(self.pos, 160),
-                .{ .flip_x = self.facing == .Left },
+                @mod(self.pos, SCREEN_SIZE),
+                @divFloor(self.pos, SCREEN_SIZE),
+                .{ .flip_x = self.direction == .Left },
             );
             return;
         }
@@ -119,38 +194,46 @@ const Jeff = struct {
         const offset: i32 = if (self.onRope()) 2 else 0;
         tiles.jeff[@intCast(@mod(@divFloor(self.pos, 8), 2) + offset)]
             .draw(
-            @mod(self.pos, 160),
-            @divFloor(self.pos, 160),
-            .{ .flip_x = self.facing == .Left },
+            @mod(self.pos, SCREEN_SIZE),
+            @divFloor(self.pos, SCREEN_SIZE),
+            .{ .flip_x = self.direction == .Left },
         );
     }
 
     fn getXpx(self: Self) i32 {
-        return @mod(self.pos, 160);
+        return @mod(self.pos, SCREEN_SIZE);
     }
 
     fn getYpx(self: Self) i32 {
-        return @divFloor(self.pos, 160);
-    }
-
-    fn getBottomY(self: Self) i32 {
-        return @divFloor(self.pos, 160 * 8);
+        return @divFloor(self.pos, SCREEN_SIZE);
     }
 
     fn getX(self: Self) i32 {
-        return @divFloor(@mod(self.pos + 3, 160), 8);
+        const xpx = self.getXpx();
+        const x = @divFloor(xpx, 8);
+        return switch (@mod(xpx, 8)) {
+            0...3 => x,
+            4...7 => x + 1,
+            else => unreachable,
+        };
     }
 
     fn getY(self: Self) i32 {
-        return @divFloor(self.pos, 160 * 8);
+        const ypx = self.getYpx();
+        const y = @divFloor(ypx, 8);
+        return switch (@mod(ypx, 8)) {
+            0...3 => y,
+            4...7 => y + 1,
+            else => unreachable,
+        };
     }
 
     fn setX(self: *Self, x: i32) void {
-        self.pos = self.getYpx() * 160 + (x * 8);
+        self.pos = self.getYpx() * SCREEN_SIZE + (x * 8);
     }
 
     fn setY(self: *Self, y: i32) void {
-        self.pos = (y * 160 * 8) + self.getXpx();
+        self.pos = (y * SCREEN_SIZE * 8) + self.getXpx();
     }
 
     // Direction is fighting game numpad notation
@@ -158,31 +241,30 @@ const Jeff = struct {
         if (direction > 9) {
             @compileError("direction exceeded 9");
         }
-        const dx =
-            if (@mod(direction, 3) == 0) 1 else if (direction == 5 or direction == 2 or direction == 8) 0 else -1;
+        const dx = if (@mod(direction, 3) == 0) 1 else if (direction == 5 or direction == 2 or direction == 8) 0 else -1;
         const dy = if (direction <= 3) 1 else if (direction >= 7) -1 else 0;
 
-        return level.terrain //
-        [@intCast(self.getY() + dy)] //
-        [@intCast(self.getX() + dx)];
+        return level.getTile(
+            @intCast(self.getX() + dx),
+            @intCast(self.getY() + dy),
+        );
     }
     fn setTile(self: *Self, comptime direction: u4, tile: Tile) void {
         if (direction > 9) {
             @compileError("direction exceeded 9");
         }
-        const dx =
-            if (@mod(direction, 3) == 0) 1 else if (direction == 5 or @mod(direction, 2) == 0) 0 else -1;
+        const dx = if (@mod(direction, 3) == 0) 1 else if (direction == 5 or @mod(direction, 2) == 0) 0 else -1;
         const dy = if (direction <= 3) 1 else if (direction >= 7) -1 else 0;
 
-        level.terrain //
-        [@intCast(self.getY() + dy)] //
-        [@intCast(self.getX() + dx)] = tile;
+        level.setTile(
+            @intCast(self.getX() + dx),
+            @intCast(self.getY() + dy),
+            tile,
+        );
     }
 
-    fn currentTile(self: Self) *Tile {
-        return &level.terrain //
-        [@intCast(self.getY())] //
-        [@intCast(self.getX())];
+    fn currentTile(self: Self) Tile {
+        return self.getTile(5);
     }
 
     fn underTile(self: Self) Tile {
@@ -194,15 +276,17 @@ const Jeff = struct {
     }
 
     fn onLadder(self: Self) bool {
-        return self.getTile(5) == .Ladder or self.underTile() == .Ladder;
+        return self.getTile(5) == .Ladder;
     }
 
     fn onRope(self: Self) bool {
-        return self.getTile(5) == .Rope and @mod(self.getYpx(), 8) == 0;
+        return self.getTile(5) == .Rope and self.isAlignedY();
     }
 
     fn isFalling(self: Self) bool {
-        return !self.underTile().isSolid() and !self.onRope() and !self.onLadder() and self.getY() != 17;
+        return !self.onRope() //
+        and !self.onLadder() //
+        and !((self.underTile() == .Ladder or self.underTile().isBrick() or self.getY() == Level.GRID_HEIGHT - 1) and self.isAlignedY());
     }
 
     fn snapX(self: *Self) void {
@@ -213,62 +297,69 @@ const Jeff = struct {
         self.setY(self.getY());
     }
 
-    fn destroyBrick(self: *Self, direction: Direction) void {
-        switch (direction) {
-            .Left => {
-                if (self.getTile(1) == .Brick) {
-                    self.snapX();
-                    self.setTile(1, .None);
-                }
-            },
-            .Right => {
-                if (self.getTile(3) == .Brick) {
-                    self.snapY();
-                    self.setTile(3, .None);
-                }
-            },
+    fn isAlignedX(self: Self) bool {
+        return @mod(self.getXpx(), 8) == 0;
+    }
+
+    fn isAlignedY(self: Self) bool {
+        return @mod(self.getYpx(), 8) == 0;
+    }
+
+    fn dig(self: *Self, comptime direction: Direction) void {
+        const pos = switch (direction) {
+            .Left => 1,
+            .Right => 3,
+        };
+        // because of numpad notation you can just add 3 to get the above block
+        if (self.getTile(pos + 3) == .Ladder or self.getTile(pos + 3) == .LadderWin) {
+            return;
+        }
+        const target = self.getTile(pos);
+        if (target == .Brick and target.Brick == 0) {
+            self.setTile(pos, .{ .Brick = 200 });
         }
     }
 
     fn handleInput(self: *Self) void {
         if (player.isFalling()) {
             player.snapX();
-            player.pos += 160;
+            player.pos += SCREEN_SIZE;
             return;
         }
 
         const gamepad = w4.GAMEPAD1.*;
 
-        if (gamepad & w4.BUTTON_UP != 0 and self.onLadder() and (!self.overTile().isBrick() or @mod(self.getYpx(), 8) != 0)) {
-            self.pos -= 160;
-            self.facing = if (@mod(self.getY(), 2) == 0) .Left else .Right;
+        if (self.currentTile() == .Ladder and (gamepad & w4.BUTTON_UP != 0 or gamepad & w4.BUTTON_DOWN != 0)) {
+            self.snapX();
+        } else if (gamepad & w4.BUTTON_LEFT != 0 or gamepad & w4.BUTTON_RIGHT != 0) {
+            self.snapY();
+        }
+
+        if (gamepad & w4.BUTTON_UP != 0 and self.onLadder() and !(self.overTile().isBrick() and self.isAlignedY())) {
+            self.pos -= SCREEN_SIZE;
+            self.direction = if (@mod(self.getY(), 2) == 0) .Left else .Right;
 
             // Prevents jitter on top of ladders
-            if (self.underTile() != .Ladder) {
-                self.pos += 160;
+            if (!self.onLadder()) {
+                self.pos += SCREEN_SIZE;
+                self.setY(self.getY() - 1);
             }
-        } else if (gamepad & w4.BUTTON_DOWN != 0 and self.getY() != 17 and !self.underTile().isBrick()) {
-            self.pos += 160;
+        } else if (gamepad & w4.BUTTON_DOWN != 0 and self.getY() < Level.GRID_HEIGHT and !(self.underTile().isBrick() and self.isAlignedY())) {
+            self.pos += SCREEN_SIZE;
         } else if (gamepad & w4.BUTTON_DOWN != 0 and self.onRope()) {
-            self.pos += 160;
-        } else if (gamepad & w4.BUTTON_LEFT != 0 and !((self.getX() == 0 or self.getTile(4).isBrick()) and @mod(self.getXpx(), 8) == 0)) {
-            // self.snapY();
-            self.facing = .Left;
+            self.pos += SCREEN_SIZE;
+        } else if (gamepad & w4.BUTTON_LEFT != 0 and !((self.getX() == 0 or self.getTile(4).isBrick()) and self.isAlignedX())) {
+            self.direction = .Left;
             self.pos -= 1;
-        } else if (gamepad & w4.BUTTON_RIGHT != 0 and !((self.getX() == 19 or self.getTile(6).isBrick()) and @mod(self.getXpx(), 8) == 0)) {
-            self.facing = .Right;
+        } else if (gamepad & w4.BUTTON_RIGHT != 0 and !((self.getX() == Level.GRID_WIDTH - 1 or self.getTile(6).isBrick()) and self.isAlignedX())) {
+            self.direction = .Right;
             self.pos += 1;
         }
-        if (gamepad & w4.BUTTON_2 != 0) {
-            self.destroyBrick(.Left);
-        }
+
         if (gamepad & w4.BUTTON_1 != 0) {
-            self.destroyBrick(.Right);
-        }
-        if (self.onLadder() and (gamepad & w4.BUTTON_UP != 0 or gamepad & w4.BUTTON_DOWN != 0)) {
-            self.snapX();
-        } else if (self.onLadder() and (gamepad & w4.BUTTON_LEFT != 0 or gamepad & w4.BUTTON_RIGHT != 0)) {
-            self.snapY();
+            self.dig(.Right);
+        } else if (gamepad & w4.BUTTON_2 != 0) {
+            self.dig(.Left);
         }
     }
 };
@@ -279,49 +370,53 @@ var player: Jeff = undefined;
 export fn update() void {
     // Clear screen with color 4
     w4.DRAW_COLORS.* = 4;
-    w4.rect(0, 0, 160, 160);
+    w4.rect(0, 0, SCREEN_SIZE, 160);
 
     println(150, "{},{}", .{ player.getX(), player.getY() });
 
+    level.update();
     level.draw();
 
     player.handleInput();
     player.draw();
 
     w4.DRAW_COLORS.* = 1;
-    w4.rect(0, 143, 160, 1);
+    w4.rect(0, 143, SCREEN_SIZE, 1);
 
     if (player.getTile(5) == .Gold) {
         player.setTile(5, .None);
     }
     if (level.isCollected()) level.open();
-    if (player.getYpx() == 0) w4.text("win", 80, 100);
+    if (player.getYpx() == 0) start();
 }
 
 export fn start() void {
-    for (&level.terrain, 0..) |*row, y| {
-        for (row, 0..) |*tile, x| {
-            if (x == 2 and y != 17 and y > 1) tile.* = .Ladder;
-            if (y == 17) tile.* = .Brick;
-            if (y == 0 and x < 5) tile.* = .Brick;
-            if (y == 2) tile.* = .Ladder;
-            if (y == 1 and x == 16) tile.* = .LadderWin;
-            if (y == 0 and x == 16) tile.* = .LadderWin;
+    for (&level.terrain, 0..) |*tile, pos| {
+        const x = @mod(pos, Level.GRID_WIDTH);
+        const y = @divFloor(pos, Level.GRID_WIDTH);
+        if (x == 2 and y != 17 and y > 1) tile.* = .Ladder;
+        if (y == 17) tile.* = Tile.Brick();
+        if (y == 0 and x < 5) tile.* = Tile.Brick();
+        if (y == 2) tile.* = .Ladder;
+        if (y == 1 and x == 16) tile.* = .LadderWin;
+        if (y == 0 and x == 16) tile.* = .LadderWin;
 
-            if (x > 2 and y == 5) tile.* = .Rope;
+        if (x > 2 and y == 5) tile.* = .Rope;
 
-            if (x < 2 and y == 9) tile.* = .BrickFake;
-            if (x > 2 and y == 8) tile.* = .BrickHard;
-            if (x == 16 and y == 8) tile.* = .Ladder;
-            if (x == 6 and y == 7) tile.* = .Gold;
-            if (x == 7 and y == 7) tile.* = .Gold;
-            if (x == 16 and y == 10) tile.* = .Gold;
-        }
+        if (x < 2 and y == 9) tile.* = .BrickFake;
+        if (x > 2 and y == 8) tile.* = .BrickHard;
+        if (x == 7 and y == 8) tile.* = Tile.Brick();
+        if (x == 16 and y == 8) tile.* = .Ladder;
+        if (x == 6 and y == 7) tile.* = .Gold;
+        if (x == 7 and y == 7) tile.* = .Gold;
+        if (x == 7 and y == 10) tile.* = .Gold;
+        if (x == 16 and y == 10) tile.* = .Gold;
     }
-    level.terrain[1][2] = .Brick;
-    level.spawn = 16 * (160 * 8) + (4 * 8);
+    level.setTile(2, 1, Tile.Brick());
+    level.spawn = 16 * (SCREEN_SIZE * 8) + (4 * 8);
+    player = level.initPlayer();
 
-    player.pos = level.spawn;
+    // w4.trace(&level.dump());
 }
 
 const std = @import("std");
