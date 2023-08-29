@@ -1,7 +1,22 @@
+const std = @import("std");
 const w4 = @import("wasm4.zig");
 const tiles = @import("gfx.zig");
 
 const SCREEN_SIZE = 160;
+
+fn println(
+    y: i32,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    var buf: [20]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+
+    std.fmt.format(stream.writer(), fmt, args) catch unreachable;
+
+    w4.DRAW_COLORS.* = 1;
+    w4.text(stream.getWritten(), 2, y);
+}
 
 const TileTag = enum(u3) {
     None,
@@ -25,6 +40,18 @@ const Tile = union(TileTag) {
 
     const Self = @This();
 
+    fn fromTag(tag: TileTag) Self {
+        return switch (tag) {
+            .Brick => Tile.Brick(),
+            .None => .None,
+            .BrickHard => .BrickHard,
+            .BrickFake => .BrickFake,
+            .Ladder => .Ladder,
+            .LadderWin => .LadderWin,
+            .Rope => .Rope,
+            .Gold => .Gold,
+        };
+    }
     fn draw(self: Self, x: i32, y: i32) void {
         switch (self) {
             .None, .LadderWin => {},
@@ -64,7 +91,6 @@ const Tile = union(TileTag) {
             },
         }
     }
-
     fn isBrick(self: Self) bool {
         return switch (self) {
             .Brick => |state| blk: {
@@ -74,18 +100,17 @@ const Tile = union(TileTag) {
             else => false,
         };
     }
-
     fn Brick() Self {
         return Self{ .Brick = 0 };
     }
 };
 
-const Level = struct {
+const LevelState = struct {
     const GRID_HEIGHT = 18;
     const GRID_WIDTH = 20;
     terrain: [GRID_HEIGHT * GRID_WIDTH]Tile,
-    spawn: u16, // positions can't be more than 160 * 160 = 25600
-    enemies: [4]?u16,
+    player: Jeff, // positions can't be more than 160 * 160 = 25600
+    enemies: [4]?Jeff,
 
     const Self = @This();
 
@@ -101,6 +126,12 @@ const Level = struct {
                 @intCast(@mod(pos, GRID_WIDTH) * 8),
                 @intCast(@divFloor(pos, GRID_WIDTH) * 8),
             );
+        }
+        self.player.draw(0x10);
+        for (self.enemies) |opt_jeff| {
+            if (opt_jeff) |jeff| {
+                jeff.draw(0x40);
+            }
         }
     }
     fn update(self: *Self) void {
@@ -121,47 +152,129 @@ const Level = struct {
             if (tile.* == .LadderWin) tile.* = .Ladder;
         }
     }
-    fn initPlayer(self: Self) Jeff {
-        return .{ .pos = self.spawn };
-    }
     // Math time
-    // u3 * 18 * 20 = 1080bit = 135 bytes // terrain repr
+    // u3 * (18 * 20 = 360) = 1080bit = 135 bytes // terrain repr
     // u16 = 2 bytes // player spawn
     // 4 * u16 = 8 bytes // enemy spawns
     // 135 + 2 + 8 = 145 total bytes
+    const Batch = packed struct {
+        a: TileTag,
+        b: TileTag,
+        c: TileTag,
+        d: TileTag,
+        e: TileTag,
+        f: TileTag,
+        g: TileTag,
+        h: TileTag,
+    };
     fn dump(self: Self) [145]u8 {
         var terrain_data: [135]u8 = undefined;
         {
+            var batch: Batch = undefined;
+            var cursor: usize = 0; // cursor into terrain_data
+            var i: usize = 0;
             // need 135byte / 3byte (24bit) = 45 batches
-            var cursor: usize = 0;
-            while (cursor < 135) : (cursor += 3) {
-                const batch_ptr: *[8]u3 = @ptrCast(&terrain_data[cursor]);
-                for (batch_ptr) |*tile| {
-                    // for each in batch
-                    _ = tile;
-                }
+            // 360tiles / 45batches = 8 per batch
+            while (cursor < 135) : ({
+                cursor += 3;
+                i += 8;
+            }) {
+                // could probably do this in a loop or something, but
+                // FUCK manual bit shifting
+                batch = .{
+                    .a = self.terrain[i + 0],
+                    .b = self.terrain[i + 1],
+                    .c = self.terrain[i + 2],
+                    .d = self.terrain[i + 3],
+                    .e = self.terrain[i + 4],
+                    .f = self.terrain[i + 5],
+                    .g = self.terrain[i + 6],
+                    .h = self.terrain[i + 7],
+                };
+                const batchptr: *[3]u8 = @ptrCast(&batch);
+                terrain_data[cursor + 0] = batchptr[0];
+                terrain_data[cursor + 1] = batchptr[1];
+                terrain_data[cursor + 2] = batchptr[2];
             }
         }
 
-        const spawn_data: [2]u8 = @bitCast(self.spawn);
-
-        // idk man
-        // var enemy_data: [8]u8 = undefined;
-        // {
-        //     var i: usize = 0;
-        //     for (self.enemies) |enemy| {
-        //         enemy_data[i] = if (enemy == null) 0x0000 else @bitCast(enemy);
-        //     }
-        // }
-
         var out: [145]u8 = undefined;
+        for (terrain_data, 0..) |byte, i| {
+            out[i] = byte;
+        }
+
+        const spawn_data: [2]u8 = @bitCast(self.player.pos);
         out[135] = spawn_data[0];
         out[136] = spawn_data[1];
-        // for (enemy_data, 137..145) |byte, i| {
-        //     out[i] = byte;
-        // }
+
+        // TODO: Enemies
 
         return out;
+    }
+    fn parse(data: [145]u8) Self {
+        var self: Self = undefined;
+        {
+            var cursor: usize = 0; // cursor into terrain_data
+            var i: usize = 0;
+            while (cursor < 135) : ({
+                cursor += 3;
+                i += 8;
+            }) {
+                const batchptr: *const Batch = @alignCast(@ptrCast(&data[cursor]));
+                self.terrain[i + 0] = Tile.fromTag(batchptr.a);
+                self.terrain[i + 1] = Tile.fromTag(batchptr.b);
+                self.terrain[i + 2] = Tile.fromTag(batchptr.c);
+                self.terrain[i + 3] = Tile.fromTag(batchptr.d);
+                self.terrain[i + 4] = Tile.fromTag(batchptr.e);
+                self.terrain[i + 5] = Tile.fromTag(batchptr.f);
+                self.terrain[i + 6] = Tile.fromTag(batchptr.g);
+                self.terrain[i + 7] = Tile.fromTag(batchptr.h);
+            }
+        }
+
+        const spawn_ptr: *[2]u8 = @ptrCast(&self.player.pos);
+        spawn_ptr[0] = data[135];
+        spawn_ptr[1] = data[136];
+
+        // TODO: Enemies
+
+        return self;
+    }
+    fn asBase64(self: Self) [194]u8 {
+        const encoder = comptime std.base64.Base64Encoder.init(
+            std.base64.standard_alphabet_chars,
+            null,
+        );
+        var buf: [194]u8 = undefined;
+        _ = encoder.encode(&buf, &self.dump());
+        return buf;
+    }
+    fn fromBase64(string: []const u8) Self {
+        const decoder = std.base64.Base64Decoder.init(
+            std.base64.standard_alphabet_chars,
+            null,
+        );
+        var level_data: [145]u8 = undefined;
+        decoder.decode(&level_data, string) catch unreachable;
+        return Self.parse(level_data);
+    }
+    fn gameLoop(self: *Self) void {
+        w4.DRAW_COLORS.* = 1;
+        w4.rect(0, 143, SCREEN_SIZE, 1);
+
+        println(150, "{},{}", .{ self.player.getX(), self.player.getY() });
+
+        self.update();
+        self.player.handleInput();
+
+        self.draw();
+
+        if (self.player.getTile(5) == .Gold) {
+            self.player.setTile(5, .None);
+        }
+        if (self.isCollected()) {
+            self.open();
+        }
     }
 };
 
@@ -171,13 +284,13 @@ const Direction = enum {
 };
 
 const Jeff = struct {
+    pos: i16,
     direction: Direction = .Right,
-    pos: i32,
 
     const Self = @This();
 
-    fn draw(self: Self) void {
-        w4.DRAW_COLORS.* = 0x10;
+    fn draw(self: Self, color: u16) void {
+        w4.DRAW_COLORS.* = color;
 
         if (self.getTile(5) == .Ladder) {
             tiles.jeff[4]
@@ -229,11 +342,11 @@ const Jeff = struct {
     }
 
     fn setX(self: *Self, x: i32) void {
-        self.pos = self.getYpx() * SCREEN_SIZE + (x * 8);
+        self.pos = @intCast(self.getYpx() * SCREEN_SIZE + (x * 8));
     }
 
     fn setY(self: *Self, y: i32) void {
-        self.pos = (y * SCREEN_SIZE * 8) + self.getXpx();
+        self.pos = @intCast((y * SCREEN_SIZE * 8) + self.getXpx());
     }
 
     // Direction is fighting game numpad notation
@@ -286,7 +399,7 @@ const Jeff = struct {
     fn isFalling(self: Self) bool {
         return !self.onRope() //
         and !self.onLadder() //
-        and !((self.underTile() == .Ladder or self.underTile().isBrick() or self.getY() == Level.GRID_HEIGHT - 1) and self.isAlignedY());
+        and !((self.underTile() == .Ladder or self.underTile().isBrick() or self.getY() == LevelState.GRID_HEIGHT - 1) and self.isAlignedY());
     }
 
     fn snapX(self: *Self) void {
@@ -321,9 +434,9 @@ const Jeff = struct {
     }
 
     fn handleInput(self: *Self) void {
-        if (player.isFalling()) {
-            player.snapX();
-            player.pos += SCREEN_SIZE;
+        if (level.player.isFalling()) {
+            level.player.snapX();
+            level.player.pos += SCREEN_SIZE;
             return;
         }
 
@@ -344,14 +457,14 @@ const Jeff = struct {
                 self.pos += SCREEN_SIZE;
                 self.setY(self.getY() - 1);
             }
-        } else if (gamepad & w4.BUTTON_DOWN != 0 and self.getY() < Level.GRID_HEIGHT and !(self.underTile().isBrick() and self.isAlignedY())) {
+        } else if (gamepad & w4.BUTTON_DOWN != 0 and self.getY() < LevelState.GRID_HEIGHT and !(self.underTile().isBrick() and self.isAlignedY())) {
             self.pos += SCREEN_SIZE;
         } else if (gamepad & w4.BUTTON_DOWN != 0 and self.onRope()) {
             self.pos += SCREEN_SIZE;
         } else if (gamepad & w4.BUTTON_LEFT != 0 and !((self.getX() == 0 or self.getTile(4).isBrick()) and self.isAlignedX())) {
             self.direction = .Left;
             self.pos -= 1;
-        } else if (gamepad & w4.BUTTON_RIGHT != 0 and !((self.getX() == Level.GRID_WIDTH - 1 or self.getTile(6).isBrick()) and self.isAlignedX())) {
+        } else if (gamepad & w4.BUTTON_RIGHT != 0 and !((self.getX() == LevelState.GRID_WIDTH - 1 or self.getTile(6).isBrick()) and self.isAlignedX())) {
             self.direction = .Right;
             self.pos += 1;
         }
@@ -364,72 +477,64 @@ const Jeff = struct {
     }
 };
 
-var level: Level = undefined;
-var player: Jeff = undefined;
+// TODO: fix mess of global state
+var level: *LevelState = undefined;
 
+export fn start() void {}
 export fn update() void {
+    level = &game.Level;
+
     // Clear screen with color 4
     w4.DRAW_COLORS.* = 4;
     w4.rect(0, 0, SCREEN_SIZE, 160);
 
-    println(150, "{},{}", .{ player.getX(), player.getY() });
-
-    level.update();
-    level.draw();
-
-    player.handleInput();
-    player.draw();
-
-    w4.DRAW_COLORS.* = 1;
-    w4.rect(0, 143, SCREEN_SIZE, 1);
-
-    if (player.getTile(5) == .Gold) {
-        player.setTile(5, .None);
+    switch (game) {
+        .Menu => menu(),
+        .Level => level.gameLoop(),
+        // .Level => |*state| state.gameLoop(), // idk why this doesn't work
+        .LevelTransition => {},
+        .Editor => {},
     }
-    if (level.isCollected()) level.open();
-    if (player.getYpx() == 0) start();
 }
 
-export fn start() void {
-    for (&level.terrain, 0..) |*tile, pos| {
-        const x = @mod(pos, Level.GRID_WIDTH);
-        const y = @divFloor(pos, Level.GRID_WIDTH);
-        if (x == 2 and y != 17 and y > 1) tile.* = .Ladder;
-        if (y == 17) tile.* = Tile.Brick();
-        if (y == 0 and x < 5) tile.* = Tile.Brick();
-        if (y == 2) tile.* = .Ladder;
-        if (y == 1 and x == 16) tile.* = .LadderWin;
-        if (y == 0 and x == 16) tile.* = .LadderWin;
+const levels = [_][]const u8{
+    "SRIAAAAABQAEAAAAAFAAJEmSJEmSJAkQAAAAAAAAAAEAAAAAAADQtm3btm3bAAEAAAAAAAAQwA8AAAAAACUpkiRJlLQRAAAAAAAAAAHgAAAABwAQAAAAAAAAAAEAAAAAAAAQAAAAAAAAAAEAAAAAAAAQAAAAAAAAAAEAAAAAAJAkSZIkSZIkIFAAAAAAAAAAAA",
+};
 
-        if (x > 2 and y == 5) tile.* = .Rope;
+const MenuState = enum {
+    Start,
+    Editor,
+};
+const GameState = union(enum) {
+    Menu: MenuState,
+    Level: LevelState,
+    LevelTransition: void,
+    Editor: void,
+};
+var game = GameState{ .Menu = .Start };
 
-        if (x < 2 and y == 9) tile.* = .BrickFake;
-        if (x > 2 and y == 8) tile.* = .BrickHard;
-        if (x == 7 and y == 8) tile.* = Tile.Brick();
-        if (x == 16 and y == 8) tile.* = .Ladder;
-        if (x == 6 and y == 7) tile.* = .Gold;
-        if (x == 7 and y == 7) tile.* = .Gold;
-        if (x == 7 and y == 10) tile.* = .Gold;
-        if (x == 16 and y == 10) tile.* = .Gold;
-    }
-    level.setTile(2, 1, Tile.Brick());
-    level.spawn = 16 * (SCREEN_SIZE * 8) + (4 * 8);
-    player = level.initPlayer();
-
-    // w4.trace(&level.dump());
-}
-
-const std = @import("std");
-fn println(
-    y: i32,
-    comptime fmt: []const u8,
-    args: anytype,
-) void {
-    var buf: [20]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-
-    std.fmt.format(stream.writer(), fmt, args) catch unreachable;
-
+fn menu() void {
+    w4.DRAW_COLORS.* = 0x14;
+    w4.rect(30, 60, 100, 38);
     w4.DRAW_COLORS.* = 1;
-    w4.text(stream.getWritten(), 2, y);
+    w4.text("Start game", 42, 65);
+    w4.text("Editor", 42, 85);
+    const cursor_y: i32 = switch (game.Menu) {
+        .Start => 65,
+        .Editor => 85,
+    };
+    w4.text(">", 33, cursor_y);
+
+    const gamepad = w4.GAMEPAD1.*;
+    if (gamepad & w4.BUTTON_UP != 0) {
+        game.Menu = .Start;
+    } else if (gamepad & w4.BUTTON_DOWN != 0) {
+        game.Menu = .Editor;
+    } else if (gamepad & w4.BUTTON_1 != 0) {
+        game = .{ .Level = LevelState.fromBase64(levels[0]) };
+        // TODO: make it so the pressed button doesn't get transferred into the
+        // game input if held for longer than 1 frame
+    }
 }
+
+fn editor() void {}
