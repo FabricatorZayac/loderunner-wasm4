@@ -132,7 +132,7 @@ const LevelState = struct {
     }
     fn draw(self: Self, mode: GameStateTag) void {
         w4.DRAW_COLORS.* = 1;
-        w4.rect(0, 143, SCREEN_SIZE, 1);
+        w4.hline(0, 143, SCREEN_SIZE);
         for (self.terrain, 0..) |tile, pos| {
             tile.draw(
                 @intCast(@mod(pos, GRID_WIDTH) * 8),
@@ -261,7 +261,6 @@ const LevelState = struct {
         decoder.decode(&level_data, string) catch unreachable;
         return Self.parse(level_data);
     }
-
     fn loop(self: *Self) void {
         println(150, "{},{}", .{ self.player.getX(), self.player.getY() });
 
@@ -275,6 +274,9 @@ const LevelState = struct {
         }
         if (self.isCollected()) {
             self.open();
+            if (self.player.getYpx() == 0) {
+                game = .LevelTransition;
+            }
         }
     }
 };
@@ -313,15 +315,12 @@ const Jeff = struct {
             .{ .flip_x = self.direction == .Left },
         );
     }
-
     fn getXpx(self: Self) i32 {
         return @mod(self.pos, SCREEN_SIZE);
     }
-
     fn getYpx(self: Self) i32 {
         return @divFloor(self.pos, SCREEN_SIZE);
     }
-
     fn getX(self: Self) i32 {
         const xpx = self.getXpx();
         const x = @divFloor(xpx, 8);
@@ -331,7 +330,6 @@ const Jeff = struct {
             else => unreachable,
         };
     }
-
     fn getY(self: Self) i32 {
         const ypx = self.getYpx();
         const y = @divFloor(ypx, 8);
@@ -341,15 +339,12 @@ const Jeff = struct {
             else => unreachable,
         };
     }
-
     fn setX(self: *Self, x: i32) void {
         self.pos = @intCast(self.getYpx() * SCREEN_SIZE + (x * 8));
     }
-
     fn setY(self: *Self, y: i32) void {
         self.pos = @intCast((y * SCREEN_SIZE * 8) + self.getXpx());
     }
-
     // Direction is fighting game numpad notation
     // NOTE: Probably a bit overcomplicated
     fn getTile(self: Self, comptime direction: u4) Tile {
@@ -377,49 +372,38 @@ const Jeff = struct {
             tile,
         );
     }
-
     fn currentTile(self: Self) Tile {
         return self.getTile(5);
     }
-
     fn underTile(self: Self) Tile {
         return self.getTile(2);
     }
-
     fn overTile(self: Self) Tile {
         return self.getTile(8);
     }
-
     fn onLadder(self: Self) bool {
         return self.getTile(5) == .Ladder;
     }
-
     fn onRope(self: Self) bool {
         return self.getTile(5) == .Rope and self.isAlignedY();
     }
-
     fn isFalling(self: Self) bool {
         return !self.onRope() //
         and !self.onLadder() //
         and !((self.underTile() == .Ladder or self.underTile().isBrick() or self.getY() == LevelState.GRID_HEIGHT - 1) and self.isAlignedY());
     }
-
     fn snapX(self: *Self) void {
         self.setX(self.getX());
     }
-
     fn snapY(self: *Self) void {
         self.setY(self.getY());
     }
-
     fn isAlignedX(self: Self) bool {
         return @mod(self.getXpx(), 8) == 0;
     }
-
     fn isAlignedY(self: Self) bool {
         return @mod(self.getYpx(), 8) == 0;
     }
-
     fn dig(self: *Self, comptime direction: Direction) void {
         const pos = switch (direction) {
             .Left => 1,
@@ -494,18 +478,28 @@ export fn update() void {
         .Level => |*level| level.loop(),
         .LevelTransition => {
             // TODO: have a level transition animation with state and stuff
-
+            if (next_level == levelpack.len) {
+                game = .Win;
+                return;
+            }
             if (w4.GAMEPAD1.* & w4.BUTTON_1 != 0) return;
             game = .{ .Level = LevelState.fromBase64(levelpack[next_level]) };
             next_level += 1;
         },
         .Editor => |*editor| editor.loop(),
+        .Win => {
+            w4.DRAW_COLORS.* = 1;
+            w4.text("Thank you", 45, 70);
+            w4.text("for playing", 37, 80);
+        },
+        .Death => {},
     }
     prev_mouse = MouseState.get();
 }
 
 const levelpack = [_][]const u8{
     "SRIAAAAABQAEAAAAAFAAJEmSJEmSJAkQAAAAAAAAAAEAAAAAAADQtm3btm3bAAEAAAAAAAAQwA8AAAAAACUpkiRJlLQRAAAAAAAAAAHgAAAABwAQAAAAAAAAAAEAAAAAAAAQAAAAAAAAAAEAAAAAAAAQAAAAAAAAAAEAAAAAAJAkSZIkSZIkIFAAAAAAAAAAAA",
+    "KAAAAAAAAIoCAAAAAACgIAAAAAAAAAoCAAAAAACgoKQkSZIkSQICAAAcAA4AIAAAwAHgAAACAAAcAA4AIAAAAADgAAACAAAAAAAAo23btm3btg0CAAAAAAAAIADgAHAAAAACAA4ABwAAIADgAHAAAAACAAAAAAAAIAAAAAAAAJAkSZIkSZIkKFAAAAAAAAAAAA",
 };
 
 const MenuState = enum {
@@ -517,19 +511,23 @@ const GameStateTag = enum {
     Level,
     LevelTransition,
     Editor,
+    Win,
+    Death,
 };
 const GameState = union(GameStateTag) {
     Menu: MenuState,
     Level: LevelState,
     LevelTransition: void,
     Editor: EditorState,
+    Win: void,
+    Death: void,
 
     const Self = @This();
 
     fn Editor() Self {
         return .{ .Editor = .{
             .level = undefined,
-            .brush = 0,
+            .selection = 0,
         } };
     }
 };
@@ -574,11 +572,11 @@ const MouseState = struct {
     },
 
     const Self = @This();
-
     fn get() Self {
         return .{
-            .x = w4.MOUSE_X.*,
-            .y = w4.MOUSE_Y.*,
+            // the underflow bug was fucking hilarious btw, rewriting program memory
+            .x = @min(@max(w4.MOUSE_X.*, 0), 159),
+            .y = @min(@max(w4.MOUSE_Y.*, 0), 159),
             .buttons = .{
                 .left = w4.MOUSE_BUTTONS.* & w4.MOUSE_LEFT != 0,
                 .right = w4.MOUSE_BUTTONS.* & w4.MOUSE_RIGHT != 0,
@@ -618,7 +616,7 @@ const GamepadState = struct {
 
 const EditorState = struct {
     level: LevelState,
-    brush: u8,
+    selection: u8,
 
     const Self = @This();
 
@@ -636,25 +634,25 @@ const EditorState = struct {
         w4.text("D", 10 * 12 + 4, 148);
 
         w4.DRAW_COLORS.* = 0x10;
-        w4.rect(self.brush * 12 + 2, 146, 12, 12);
+        w4.rect(self.selection * 12 + 2, 146, 12, 12);
 
         const mouse = MouseState.get();
         if (mouse.buttons.left) {
             if (mouse.y > 142) {
                 const button: u8 = @intCast(@divFloor(mouse.x - 2, 12));
                 if (button < 10) {
-                    self.brush = button;
+                    self.selection = button;
                 } else if (button == 10 and !prev_mouse.buttons.left) {
                     w4.trace(&self.level.asBase64());
                 }
             } else {
-                if (self.brush < 8) {
+                if (self.selection < 8) {
                     self.level.setTile(
                         @intCast(@divFloor(mouse.x, 8)),
                         @intCast(@divFloor(mouse.y, 8)),
-                        Tile.fromTag(@enumFromInt(self.brush)),
+                        Tile.fromTag(@enumFromInt(self.selection)),
                     );
-                } else if (self.brush == 8) {
+                } else if (self.selection == 8) {
                     self.level.player.pos = mouse.x + mouse.y * 160;
                     self.level.player.snapX();
                     self.level.player.snapY();
@@ -663,5 +661,7 @@ const EditorState = struct {
                 }
             }
         }
+        const gamepad = GamepadState.get(0);
+        if (gamepad.right) {}
     }
 };
