@@ -192,18 +192,9 @@ const LevelState = struct {
                 cursor += 3;
                 i += 8;
             }) {
-                // could probably do this in a loop or something, but
-                // FUCK manual bit shifting
-                batch = .{
-                    .a = self.terrain[i + 0],
-                    .b = self.terrain[i + 1],
-                    .c = self.terrain[i + 2],
-                    .d = self.terrain[i + 3],
-                    .e = self.terrain[i + 4],
-                    .f = self.terrain[i + 5],
-                    .g = self.terrain[i + 6],
-                    .h = self.terrain[i + 7],
-                };
+                inline for (@typeInfo(Batch).Struct.fields, 0..) |field, j| {
+                    @field(batch, field.name) = self.terrain[i + j];
+                }
                 const batchptr: *[3]u8 = @ptrCast(&batch);
                 terrain_data[cursor + 0] = batchptr[0];
                 terrain_data[cursor + 1] = batchptr[1];
@@ -238,14 +229,9 @@ const LevelState = struct {
                 i += 8;
             }) {
                 const batchptr: *const Batch = @alignCast(@ptrCast(&data[cursor]));
-                self.terrain[i + 0] = Tile.fromTag(batchptr.a);
-                self.terrain[i + 1] = Tile.fromTag(batchptr.b);
-                self.terrain[i + 2] = Tile.fromTag(batchptr.c);
-                self.terrain[i + 3] = Tile.fromTag(batchptr.d);
-                self.terrain[i + 4] = Tile.fromTag(batchptr.e);
-                self.terrain[i + 5] = Tile.fromTag(batchptr.f);
-                self.terrain[i + 6] = Tile.fromTag(batchptr.g);
-                self.terrain[i + 7] = Tile.fromTag(batchptr.h);
+                inline for (@typeInfo(Batch).Struct.fields, 0..) |field, j| {
+                    self.terrain[i + j] = Tile.fromTag(@field(batchptr, field.name));
+                }
             }
         }
 
