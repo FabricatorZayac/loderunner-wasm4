@@ -30,7 +30,7 @@ const TileTag = enum(u3) {
 };
 const Tile = union(TileTag) {
     None: void,
-    Brick: u16, // 0 is solid, 65535 is freshly dug. Decrement every tick
+    Brick: u16,
     BrickHard: void,
     BrickFake: void,
     Ladder: void,
@@ -52,9 +52,15 @@ const Tile = union(TileTag) {
             .Gold => .Gold,
         };
     }
-    fn draw(self: Self, x: i32, y: i32) void {
+    fn draw(self: Self, x: i32, y: i32, mode: GameStateTag) void {
         switch (self) {
-            .None, .LadderWin => {},
+            .None => {},
+            .LadderWin => {
+                if (mode == .Editor) {
+                    w4.DRAW_COLORS.* = 0x2;
+                    tiles.ladder.draw(x, y, .{});
+                }
+            },
             .Brick => |state| {
                 switch (state) {
                     0 => {
@@ -72,6 +78,10 @@ const Tile = union(TileTag) {
             .BrickFake => {
                 w4.DRAW_COLORS.* = 0x3;
                 tiles.brick.draw(x, y, .{});
+                if (mode == .Editor) {
+                    w4.DRAW_COLORS.* = 0x1;
+                    w4.line(x, y, x + 7, y + 6);
+                }
             },
             .BrickHard => {
                 w4.DRAW_COLORS.* = 0x13;
@@ -109,7 +119,7 @@ const LevelState = struct {
     const GRID_HEIGHT = 18;
     const GRID_WIDTH = 20;
     terrain: [GRID_HEIGHT * GRID_WIDTH]Tile,
-    player: Jeff, // positions can't be more than 160 * 160 = 25600
+    player: Jeff,
     enemies: [4]?Jeff,
 
     const Self = @This();
@@ -120,11 +130,14 @@ const LevelState = struct {
     fn setTile(self: *Self, x: usize, y: usize, newtile: Tile) void {
         self.terrain[y * GRID_WIDTH + x] = newtile;
     }
-    fn draw(self: Self) void {
+    fn draw(self: Self, mode: GameStateTag) void {
+        w4.DRAW_COLORS.* = 1;
+        w4.rect(0, 143, SCREEN_SIZE, 1);
         for (self.terrain, 0..) |tile, pos| {
             tile.draw(
                 @intCast(@mod(pos, GRID_WIDTH) * 8),
                 @intCast(@divFloor(pos, GRID_WIDTH) * 8),
+                mode,
             );
         }
         self.player.draw(0x10);
@@ -208,6 +221,10 @@ const LevelState = struct {
         out[136] = spawn_data[1];
 
         // TODO: Enemies
+        // for now zero it out to prevent trash data
+        for (out[137..]) |*i| {
+            i.* = 0;
+        }
 
         return out;
     }
@@ -258,16 +275,14 @@ const LevelState = struct {
         decoder.decode(&level_data, string) catch unreachable;
         return Self.parse(level_data);
     }
-    fn gameLoop(self: *Self) void {
-        w4.DRAW_COLORS.* = 1;
-        w4.rect(0, 143, SCREEN_SIZE, 1);
 
+    fn loop(self: *Self) void {
         println(150, "{},{}", .{ self.player.getX(), self.player.getY() });
 
         self.update();
         self.player.handleInput();
 
-        self.draw();
+        self.draw(.Level);
 
         if (self.player.getTile(5) == .Gold) {
             self.player.setTile(5, .None);
@@ -292,7 +307,7 @@ const Jeff = struct {
     fn draw(self: Self, color: u16) void {
         w4.DRAW_COLORS.* = color;
 
-        if (self.getTile(5) == .Ladder) {
+        if (self.currentTile() == .Ladder) {
             tiles.jeff[4]
                 .draw(
                 @mod(self.pos, SCREEN_SIZE),
@@ -350,6 +365,7 @@ const Jeff = struct {
     }
 
     // Direction is fighting game numpad notation
+    // NOTE: Probably a bit overcomplicated
     fn getTile(self: Self, comptime direction: u4) Tile {
         if (direction > 9) {
             @compileError("direction exceeded 9");
@@ -357,7 +373,7 @@ const Jeff = struct {
         const dx = if (@mod(direction, 3) == 0) 1 else if (direction == 5 or direction == 2 or direction == 8) 0 else -1;
         const dy = if (direction <= 3) 1 else if (direction >= 7) -1 else 0;
 
-        return level.getTile(
+        return game.Level.getTile(
             @intCast(self.getX() + dx),
             @intCast(self.getY() + dy),
         );
@@ -369,7 +385,7 @@ const Jeff = struct {
         const dx = if (@mod(direction, 3) == 0) 1 else if (direction == 5 or @mod(direction, 2) == 0) 0 else -1;
         const dy = if (direction <= 3) 1 else if (direction >= 7) -1 else 0;
 
-        level.setTile(
+        game.Level.setTile(
             @intCast(self.getX() + dx),
             @intCast(self.getY() + dy),
             tile,
@@ -434,21 +450,21 @@ const Jeff = struct {
     }
 
     fn handleInput(self: *Self) void {
-        if (level.player.isFalling()) {
-            level.player.snapX();
-            level.player.pos += SCREEN_SIZE;
+        if (self.isFalling()) {
+            self.snapX();
+            self.pos += SCREEN_SIZE;
             return;
         }
 
-        const gamepad = w4.GAMEPAD1.*;
+        const gamepad = GamepadState.get(0);
 
-        if (self.currentTile() == .Ladder and (gamepad & w4.BUTTON_UP != 0 or gamepad & w4.BUTTON_DOWN != 0)) {
+        if (self.currentTile() == .Ladder and (gamepad.up or gamepad.down)) {
             self.snapX();
-        } else if (gamepad & w4.BUTTON_LEFT != 0 or gamepad & w4.BUTTON_RIGHT != 0) {
+        } else if (gamepad.left or gamepad.right) {
             self.snapY();
         }
 
-        if (gamepad & w4.BUTTON_UP != 0 and self.onLadder() and !(self.overTile().isBrick() and self.isAlignedY())) {
+        if (gamepad.up and self.onLadder() and !(self.overTile().isBrick() and self.isAlignedY())) {
             self.pos -= SCREEN_SIZE;
             self.direction = if (@mod(self.getY(), 2) == 0) .Left else .Right;
 
@@ -457,47 +473,52 @@ const Jeff = struct {
                 self.pos += SCREEN_SIZE;
                 self.setY(self.getY() - 1);
             }
-        } else if (gamepad & w4.BUTTON_DOWN != 0 and self.getY() < LevelState.GRID_HEIGHT and !(self.underTile().isBrick() and self.isAlignedY())) {
+        } else if (gamepad.down and self.getY() < LevelState.GRID_HEIGHT and !(self.underTile().isBrick() and self.isAlignedY())) {
             self.pos += SCREEN_SIZE;
-        } else if (gamepad & w4.BUTTON_DOWN != 0 and self.onRope()) {
+        } else if (gamepad.down and self.onRope()) {
             self.pos += SCREEN_SIZE;
-        } else if (gamepad & w4.BUTTON_LEFT != 0 and !((self.getX() == 0 or self.getTile(4).isBrick()) and self.isAlignedX())) {
+        } else if (gamepad.left and !((self.getX() == 0 or self.getTile(4).isBrick()) and self.isAlignedX())) {
             self.direction = .Left;
             self.pos -= 1;
-        } else if (gamepad & w4.BUTTON_RIGHT != 0 and !((self.getX() == LevelState.GRID_WIDTH - 1 or self.getTile(6).isBrick()) and self.isAlignedX())) {
+        } else if (gamepad.right and !((self.getX() == LevelState.GRID_WIDTH - 1 or self.getTile(6).isBrick()) and self.isAlignedX())) {
             self.direction = .Right;
             self.pos += 1;
         }
 
-        if (gamepad & w4.BUTTON_1 != 0) {
+        if (gamepad.buttons[0]) {
             self.dig(.Right);
-        } else if (gamepad & w4.BUTTON_2 != 0) {
+        } else if (gamepad.buttons[1]) {
             self.dig(.Left);
         }
     }
 };
 
-// TODO: fix mess of global state
-var level: *LevelState = undefined;
+var next_level: u8 = 0;
 
 export fn start() void {}
-export fn update() void {
-    level = &game.Level;
 
+var prev_mouse: MouseState = undefined;
+export fn update() void {
     // Clear screen with color 4
     w4.DRAW_COLORS.* = 4;
     w4.rect(0, 0, SCREEN_SIZE, 160);
 
     switch (game) {
         .Menu => menu(),
-        .Level => level.gameLoop(),
-        // .Level => |*state| state.gameLoop(), // idk why this doesn't work
-        .LevelTransition => {},
-        .Editor => {},
+        .Level => |*level| level.loop(),
+        .LevelTransition => {
+            // TODO: have a level transition animation with state and stuff
+
+            if (w4.GAMEPAD1.* & w4.BUTTON_1 != 0) return;
+            game = .{ .Level = LevelState.fromBase64(levelpack[next_level]) };
+            next_level += 1;
+        },
+        .Editor => |*editor| editor.loop(),
     }
+    prev_mouse = MouseState.get();
 }
 
-const levels = [_][]const u8{
+const levelpack = [_][]const u8{
     "SRIAAAAABQAEAAAAAFAAJEmSJEmSJAkQAAAAAAAAAAEAAAAAAADQtm3btm3bAAEAAAAAAAAQwA8AAAAAACUpkiRJlLQRAAAAAAAAAAHgAAAABwAQAAAAAAAAAAEAAAAAAAAQAAAAAAAAAAEAAAAAAAAQAAAAAAAAAAEAAAAAAJAkSZIkSZIkIFAAAAAAAAAAAA",
 };
 
@@ -505,11 +526,26 @@ const MenuState = enum {
     Start,
     Editor,
 };
-const GameState = union(enum) {
+const GameStateTag = enum {
+    Menu,
+    Level,
+    LevelTransition,
+    Editor,
+};
+const GameState = union(GameStateTag) {
     Menu: MenuState,
     Level: LevelState,
     LevelTransition: void,
-    Editor: void,
+    Editor: EditorState,
+
+    const Self = @This();
+
+    fn Editor() Self {
+        return .{ .Editor = .{
+            .level = undefined,
+            .brush = 0,
+        } };
+    }
 };
 var game = GameState{ .Menu = .Start };
 
@@ -525,16 +561,121 @@ fn menu() void {
     };
     w4.text(">", 33, cursor_y);
 
-    const gamepad = w4.GAMEPAD1.*;
-    if (gamepad & w4.BUTTON_UP != 0) {
+    const gamepad = GamepadState.get(0);
+    if (gamepad.up) {
         game.Menu = .Start;
-    } else if (gamepad & w4.BUTTON_DOWN != 0) {
+    } else if (gamepad.down) {
         game.Menu = .Editor;
-    } else if (gamepad & w4.BUTTON_1 != 0) {
-        game = .{ .Level = LevelState.fromBase64(levels[0]) };
-        // TODO: make it so the pressed button doesn't get transferred into the
-        // game input if held for longer than 1 frame
+    } else if (gamepad.buttons[0]) {
+        switch (game.Menu) {
+            .Start => {
+                game = .LevelTransition;
+            },
+            .Editor => {
+                game = GameState.Editor();
+            },
+        }
     }
 }
 
-fn editor() void {}
+const MouseState = struct {
+    x: i16,
+    y: i16,
+    buttons: struct {
+        left: bool,
+        right: bool,
+        middle: bool,
+    },
+
+    const Self = @This();
+
+    fn get() Self {
+        return .{
+            .x = w4.MOUSE_X.*,
+            .y = w4.MOUSE_Y.*,
+            .buttons = .{
+                .left = w4.MOUSE_BUTTONS.* & w4.MOUSE_LEFT != 0,
+                .right = w4.MOUSE_BUTTONS.* & w4.MOUSE_RIGHT != 0,
+                .middle = w4.MOUSE_BUTTONS.* & w4.MOUSE_MIDDLE != 0,
+            },
+        };
+    }
+};
+const GamepadState = struct {
+    buttons: [2]bool,
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+
+    const Self = @This();
+
+    fn get(player: u2) Self {
+        const gamepad = switch (player) {
+            0 => w4.GAMEPAD1.*,
+            1 => w4.GAMEPAD2.*,
+            2 => w4.GAMEPAD3.*,
+            3 => w4.GAMEPAD4.*,
+        };
+        return .{
+            .buttons = .{
+                gamepad & w4.BUTTON_1 != 0,
+                gamepad & w4.BUTTON_2 != 0,
+            },
+            .up = gamepad & w4.BUTTON_UP != 0,
+            .down = gamepad & w4.BUTTON_DOWN != 0,
+            .left = gamepad & w4.BUTTON_LEFT != 0,
+            .right = gamepad & w4.BUTTON_RIGHT != 0,
+        };
+    }
+};
+
+const EditorState = struct {
+    level: LevelState,
+    brush: u8,
+
+    const Self = @This();
+
+    fn loop(self: *Self) void {
+        self.level.draw(.Editor);
+        inline for (@typeInfo(TileTag).Enum.fields, 0..) |f, i| {
+            Tile.fromTag(@field(TileTag, f.name))
+                .draw(i * 12 + 4, 148, .Editor);
+        }
+        tiles.jeff[0].draw(8 * 12 + 4, 148, .{});
+        w4.DRAW_COLORS.* = 0x30;
+        tiles.jeff[0].draw(9 * 12 + 4, 148, .{});
+
+        w4.DRAW_COLORS.* = 0x1;
+        w4.text("D", 10 * 12 + 4, 148);
+
+        w4.DRAW_COLORS.* = 0x10;
+        w4.rect(self.brush * 12 + 2, 146, 12, 12);
+
+        const mouse = MouseState.get();
+        if (mouse.buttons.left) {
+            if (mouse.y > 142) {
+                const button: u8 = @intCast(@divFloor(mouse.x - 2, 12));
+                if (button < 10) {
+                    self.brush = button;
+                } else if (button == 10 and !prev_mouse.buttons.left) {
+                    w4.trace(&self.level.asBase64());
+                }
+            } else {
+                if (self.brush < 8) {
+                    self.level.setTile(
+                        @intCast(@divFloor(mouse.x, 8)),
+                        @intCast(@divFloor(mouse.y, 8)),
+                        Tile.fromTag(@enumFromInt(self.brush)),
+                    );
+                } else if (self.brush == 8) {
+                    self.level.player.pos = mouse.x + mouse.y * 160;
+                    self.level.player.snapX();
+                    self.level.player.snapY();
+                } else {
+                    // TODO: Enemies
+                }
+            }
+        }
+    }
+};
